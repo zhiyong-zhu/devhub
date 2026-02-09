@@ -4,7 +4,7 @@ import type { SSHConfig } from '@/types'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/tauri'
 import { Clock } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import { WebLinksAddon } from 'xterm-addon-web-links'
@@ -14,30 +14,35 @@ import { CommandHistoryPanel } from './CommandHistoryPanel'
 interface SSHTerminalProps {
   connectionId: string
   onDisconnect?: () => void
+  onFitAddonReady?: (fit: () => void) => void
 }
 
-export function SSHTerminal({ connectionId, onDisconnect }: SSHTerminalProps) {
+export function SSHTerminal({ connectionId, onDisconnect, onFitAddonReady }: SSHTerminalProps) {
   const terminalRef = useRef<HTMLDivElement>(null)
   const xtermRef = useRef<Terminal | null>(null)
   const fitAddonRef = useRef<FitAddon | null>(null)
-  const [sessionId, setSessionId] = useState<string | null>(null)
+  const sessionIdRef = useRef<string | null>(null)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [showHistory, setShowHistory] = useState(false)
-  const [currentCommand, setCurrentCommand] = useState('')
-  const { connections } = useConnectionStore()
+  const currentCommandRef = useRef('')
   const { addCommand } = useCommandHistoryStore()
+  const connectionsRef = useRef(useConnectionStore.getState().connections)
+
+  // 订阅 connections 变化到 ref（不触发重渲染）
+  useEffect(() => {
+    const unsub = useConnectionStore.subscribe(
+      state => { connectionsRef.current = state.connections }
+    )
+    return unsub
+  }, [])
 
   // 从连接列表中获取当前连接的配置
-  const getConnectionConfig = (): SSHConfig | null => {
-    console.log('🔍 SSHTerminal: 查找连接配置, connectionId:', connectionId)
-
+  const getConnectionConfig = useCallback((): SSHConfig | null => {
     const isBrowser = !window.__TAURI__
-    let displayConnections = connections
+    let displayConnections = connectionsRef.current
 
-    // 在浏览器中使用模拟数据
-    if (isBrowser && connections.length === 0) {
-      console.log('🌐 SSHTerminal: 使用模拟数据')
+    if (isBrowser && displayConnections.length === 0) {
       displayConnections = [
         {
           id: 'mock-1',
@@ -57,22 +62,20 @@ export function SSHTerminal({ connectionId, onDisconnect }: SSHTerminalProps) {
     }
 
     const connection = displayConnections.find(c => c.id === connectionId)
-    console.log('📌 SSHTerminal: 找到的连接', connection?.name)
-
-    if (!connection || connection.type !== 'ssh') {
-      console.log('❌ SSHTerminal: 连接不存在或不是 SSH 类型')
-      return null
-    }
-
-    console.log('✅ SSHTerminal: 返回 SSH 配置')
+    if (!connection || connection.type !== 'ssh') return null
     return connection.config as SSHConfig
-  }
+  }, [connectionId])
 
-  // 初始化终端
+  // 单一 effect：初始化终端 + 连接 SSH + 绑定输入 + 清理
+  // 仅依赖 connectionId，组件生命周期内只执行一次
   useEffect(() => {
-    if (!terminalRef.current) return
+    if (!terminalRef.current || !connectionId) return
 
-    // 创建终端实例
+    let cancelled = false
+    let unlistenFn: (() => void) | null = null
+    let inputDisposable: { dispose: () => void } | null = null
+
+    // 1. 创建终端实例
     const term = new Terminal({
       cursorBlink: true,
       fontSize: 14,
@@ -103,64 +106,33 @@ export function SSHTerminal({ connectionId, onDisconnect }: SSHTerminalProps) {
       tabStopWidth: 4,
     })
 
-    // 创建插件
     const fitAddon = new FitAddon()
     const webLinksAddon = new WebLinksAddon()
-
     term.loadAddon(fitAddon)
     term.loadAddon(webLinksAddon)
-
-    // 打开终端
     term.open(terminalRef.current)
     fitAddon.fit()
 
-    // 保存引用
     xtermRef.current = term
     fitAddonRef.current = fitAddon
 
-    // 欢迎信息
-    term.writeln('\x1b[1;32mDevHub SSH Terminal\x1b[0m')
-    term.writeln('Initializing...')
+    // 暴露 fit 函数给父组件（用于分屏布局变化时重新适配）
+    onFitAddonReady?.(() => fitAddon.fit())
 
     // 监听窗口大小变化
-    const handleResize = () => {
-      if (fitAddonRef.current) {
-        fitAddonRef.current.fit()
-      }
-    }
-
+    const handleResize = () => fitAddon.fit()
     window.addEventListener('resize', handleResize)
 
-    // 清理函数
-    return () => {
-      window.removeEventListener('resize', handleResize)
-      term.dispose()
-
-      // 断开 SSH 连接
-      if (sessionId) {
-        invoke('ssh_disconnect', { sessionId }).catch(console.error)
-      }
-    }
-  }, [sessionId])
-
-  // 连接 SSH
-  useEffect(() => {
-    if (!connectionId || !xtermRef.current) return
-
+    // 2. 连接 SSH
     const connectSSH = async () => {
       try {
         const config = getConnectionConfig()
-
         if (!config) {
           throw new Error('Connection configuration not found')
         }
 
-        xtermRef.current?.writeln(
-          '\r\n\x1b[90mConnecting to SSH server...\x1b[0m'
-        )
-        xtermRef.current?.writeln(`  Host: ${config.host}:${config.port}`)
-        xtermRef.current?.writeln(`  User: ${config.username}`)
-        xtermRef.current?.writeln(`  Auth: ${config.auth_method}`)
+        term.writeln('\x1b[1;32mDevHub SSH Terminal\x1b[0m')
+        term.writeln(`\x1b[90mConnecting to ${config.host}:${config.port}...\x1b[0m`)
 
         const id = await invoke<string>('ssh_connect', {
           host: config.host,
@@ -172,97 +144,85 @@ export function SSHTerminal({ connectionId, onDisconnect }: SSHTerminalProps) {
           passphrase: config.passphrase,
         })
 
-        setSessionId(id)
+        if (cancelled) {
+          invoke('ssh_disconnect', { sessionId: id }).catch(() => {})
+          return
+        }
+
+        sessionIdRef.current = id
         setConnected(true)
         setError(null)
 
-        xtermRef.current?.writeln('\r\n\x1b[1;32m✓ Connected\x1b[0m')
+        term.writeln('\x1b[1;32m✓ Connected\x1b[0m\r\n')
 
-        // 监听 SSH 数据事件
-        const unlisten = await listen<string>(`ssh-data-${id}`, event => {
+        // 3. 监听 SSH 数据事件
+        unlistenFn = await listen<string>(`ssh-data-${id}`, event => {
           try {
-            // 将 Base64 编码的数据解码为二进制字符串
             const binaryString = atob(event.payload)
-            // 转换为字节数组，然后解码为 UTF-8
             const bytes = new Uint8Array(binaryString.length)
             for (let i = 0; i < binaryString.length; i++) {
               bytes[i] = binaryString.charCodeAt(i)
             }
             const decoded = new TextDecoder('utf-8').decode(bytes)
-            xtermRef.current?.write(decoded)
+            term.write(decoded)
           } catch (err) {
             console.error('Failed to decode SSH data:', err)
           }
-        })
+        }) as unknown as () => void
 
-        // 保存取消监听函数
-        return () => {
-          unlisten()
-        }
+        // 4. 绑定用户输入
+        inputDisposable = term.onData(async (data: string) => {
+          try {
+            // 记录命令历史
+            if (data === '\r') {
+              const cmd = currentCommandRef.current.trim()
+              if (cmd) {
+                addCommand(cmd, connectionId)
+                currentCommandRef.current = ''
+              }
+            } else if (data === '\x7f' || data === '\b') {
+              currentCommandRef.current = currentCommandRef.current.slice(0, -1)
+            } else if (data.length === 1 && data >= ' ') {
+              currentCommandRef.current += data
+            }
+
+            await invoke('ssh_write', {
+              sessionId: sessionIdRef.current,
+              data,
+            })
+          } catch (err) {
+            console.error('Failed to write to SSH:', err)
+            term.writeln(`\r\n\x1b[1;31mError: ${err}\x1b[0m\r\n`)
+          }
+        })
       } catch (err) {
+        if (cancelled) return
         const errorMsg = err instanceof Error ? err.message : String(err)
         setError(errorMsg)
-        xtermRef.current?.writeln(
-          `\r\n\x1b[1;31m✗ Connection failed:\x1b[0m ${errorMsg}`
-        )
-        xtermRef.current?.writeln('\r\n')
+        term.writeln(`\r\n\x1b[1;31m✗ Connection failed:\x1b[0m ${errorMsg}`)
       }
     }
 
-    const cleanupPromise = connectSSH()
+    connectSSH()
 
+    // 清理函数
     return () => {
-      cleanupPromise.then(cleanup => cleanup?.()).catch(console.error)
-    }
-  }, [connectionId, connections])
+      cancelled = true
+      window.removeEventListener('resize', handleResize)
+      inputDisposable?.dispose()
+      unlistenFn?.()
+      term.dispose()
+      xtermRef.current = null
+      fitAddonRef.current = null
 
-  // 监听用户输入
-  useEffect(() => {
-    const term = xtermRef.current
-    if (!term || !sessionId || !connected) {
-      console.log('SSH Terminal: 跳过 onData 绑定', {
-        term: !!term,
-        sessionId,
-        connected,
-      })
-      return
-    }
-
-    console.log('SSH Terminal: 绑定 onData 事件监听器')
-
-    const disposable = term.onData(async (data: string) => {
-      try {
-        console.log('SSH Terminal: 收到输入数据', data.length, 'bytes')
-
-        // 记录命令历史（检测回车键）
-        if (data === '\r') {
-          if (currentCommand.trim()) {
-            addCommand(currentCommand.trim(), connectionId)
-            setCurrentCommand('')
-          }
-        } else if (data === '\x7f' || data === '\b') {
-          // 退格键
-          setCurrentCommand(prev => prev.slice(0, -1))
-        } else if (data.length === 1 && data >= ' ') {
-          // 可打印字符
-          setCurrentCommand(prev => prev + data)
-        }
-
-        await invoke('ssh_write', {
-          sessionId,
-          data,
-        })
-      } catch (err) {
-        console.error('Failed to write to SSH:', err)
-        term.writeln(`\r\n\x1b[1;31mError: ${err}\x1b[0m\r\n`)
+      if (sessionIdRef.current) {
+        invoke('ssh_disconnect', { sessionId: sessionIdRef.current }).catch(() => {})
+        sessionIdRef.current = null
       }
-    })
-
-    return () => {
-      console.log('SSH Terminal: 清理 onData 事件监听器')
-      disposable.dispose()
+      setConnected(false)
     }
-  }, [sessionId, connected, connectionId, addCommand])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectionId])
 
   // 手动调整大小
   const handleManualFit = () => {
@@ -273,17 +233,12 @@ export function SSHTerminal({ connectionId, onDisconnect }: SSHTerminalProps) {
 
   // 执行历史命令
   const handleExecuteCommand = async (command: string) => {
-    if (!sessionId || !xtermRef.current) return
-
+    if (!sessionIdRef.current || !xtermRef.current) return
     try {
-      // 将命令写入终端
-      xtermRef.current.write('\r\n')
       await invoke('ssh_write', {
-        sessionId,
+        sessionId: sessionIdRef.current,
         data: command + '\n',
       })
-
-      // 记录到历史
       addCommand(command, connectionId)
     } catch (err) {
       console.error('Failed to execute command:', err)
@@ -301,11 +256,6 @@ export function SSHTerminal({ connectionId, onDisconnect }: SSHTerminalProps) {
           <span className="text-sm text-gray-300">
             {connected ? 'Connected' : 'Connecting...'}
           </span>
-          {sessionId && (
-            <span className="text-xs text-gray-500">
-              ({sessionId.substring(0, 8)}...)
-            </span>
-          )}
         </div>
 
         <div className="flex items-center space-x-2">
@@ -329,13 +279,15 @@ export function SSHTerminal({ connectionId, onDisconnect }: SSHTerminalProps) {
           {connected && onDisconnect && (
             <button
               onClick={() => {
-                invoke('ssh_disconnect', { sessionId })
-                  .then(() => {
-                    setConnected(false)
-                    setSessionId(null)
-                    onDisconnect()
-                  })
-                  .catch(console.error)
+                if (sessionIdRef.current) {
+                  invoke('ssh_disconnect', { sessionId: sessionIdRef.current })
+                    .then(() => {
+                      setConnected(false)
+                      sessionIdRef.current = null
+                      onDisconnect()
+                    })
+                    .catch(console.error)
+                }
               }}
               className="px-3 py-1 text-xs text-white bg-red-600 hover:bg-red-700 rounded"
             >
@@ -351,7 +303,7 @@ export function SSHTerminal({ connectionId, onDisconnect }: SSHTerminalProps) {
         <div
           ref={terminalRef}
           className={`flex-1 overflow-hidden ${showHistory ? '' : 'w-full'}`}
-          style={{ minHeight: '400px' }}
+          style={{ minHeight: '100px' }}
         />
 
         {/* 命令历史面板 */}

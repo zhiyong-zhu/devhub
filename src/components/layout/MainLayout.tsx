@@ -1,11 +1,12 @@
-import { useState, useRef } from 'react'
-import { Server } from 'lucide-react'
-import { Sidebar } from './Sidebar'
-import { TabBar } from './TabBar'
-import { StatusBar } from './StatusBar'
 import { ConnectionsPage } from '@/pages/ConnectionsPage'
-import { SSHPage } from '@/pages/SSHPage'
 import { DatabasePage } from '@/pages/DatabasePage'
+import { SettingsPage } from '@/pages/SettingsPage'
+import { SSHPage } from '@/pages/SSHPage'
+import { Server } from 'lucide-react'
+import { useRef, useState } from 'react'
+import { Sidebar } from './Sidebar'
+import { StatusBar } from './StatusBar'
+import { TabBar } from './TabBar'
 
 type PageType = 'welcome' | 'connections' | 'database' | 'ssh' | 'settings'
 
@@ -60,6 +61,12 @@ export function MainLayout() {
           {visitedPages.current.has('database') && (
             <div className={`absolute inset-0 overflow-auto ${currentPage === 'database' ? '' : 'hidden'}`}>
               <DatabasePage />
+            </div>
+          )}
+
+          {visitedPages.current.has('settings') && (
+            <div className={`absolute inset-0 overflow-auto ${currentPage === 'settings' ? '' : 'hidden'}`}>
+              <SettingsPage />
             </div>
           )}
         </div>
